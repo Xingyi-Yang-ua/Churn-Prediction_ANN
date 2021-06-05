@@ -1,0 +1,322 @@
+---
+title: "Deep Learning With Keras To Predict Customer Churn"
+author: "Xingyi Yang"
+date: "11/10/2020"
+output: html_document
+---
+# Summary
+In this project, Deep Learning was used to predict customer churn. We built an ANN model using the new keras package that achieved 82% predictive accuracy (without tuning)! We used three new machine learning packages to help with preprocessing and measuring performance: recipes, rsample and yardstick. Finally we used lime to explain the Deep Learning model, which traditionally was impossible! We checked the LIME results with a Correlation Analysis, which brought to light other features to investigate. For the IBM Telco dataset, tenure, contract type, internet service type, payment menthod, senior citizen status, and online security status were useful in diagnosing customer churn. 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+# Load library
+```{r}
+library(keras)
+library(tensorflow)
+library(lime)
+library(tidyquant)
+library(rsample)
+library(recipes)
+library(yardstick)
+library(corrr)
+library(tidyverse)
+```
+# Import data
+`read_csv()` to import the data into a nice tidy data frame. 
+`glimpse()` function to quickly inspect the data
+```{r}
+churn_data_raw <- read.csv("Churn.csv")
+
+glimpse(churn_data_raw)
+```
+# Process data
+- remove unnecessary data
+```{r}
+churn_data_tbl <- churn_data_raw %>%
+  select(-ï..customerID) %>%
+  drop_na() %>%
+  select(Churn, everything())
+    
+glimpse(churn_data_tbl)
+```
+# Split Into Train/Test Sets
+- `initial_split()` function for splitting data sets into training and testing sets. The return is a special rsplit object.
+```{r}
+# Split test/training sets
+set.seed(100)
+train_test_split <- initial_split(churn_data_tbl, prop = 0.8)
+train_test_split
+```
+- We can retrieve our training and testing sets using `training()` and `testing()` functions.
+```{r}
+train_tbl <- training(train_test_split)
+test_tbl  <- testing(train_test_split) 
+
+train_tbl <- as.data.frame(train_tbl)
+test_tbl <- as.data.frame(test_tbl)
+```
+# Data processing with recipes
+A “recipe” is a series of steps you would like to perform on the training, testing and/or validation sets. We use the `recipe()` function to implement our preprocessing steps. The function takes a familiar object argument, which is a modeling function such as object = Churn ~ . meaning “Churn” is the outcome (aka response, predictor, target) and all other features are predictors. The function also takes the data argument, which gives the “recipe steps” perspective on how to apply during baking (next).
+
+1. Create a recipe
+- `step_discretize()` with the option = list(cuts = 6) to cut the continuous variable for “tenure” (number of years as a customer) to group customers into cohorts.
+- `step_log()` to log transform “TotalCharges”.
+- `step_dummy()` to one-hot encode the categorical data. Note that this adds columns of one/zero for categorical data with three or more categories.
+- `step_center()`to mean-center the data.
+- `step_scale()` to scale the data.
+-  `prep()` function is used to prepare the recipe.
+```{r}
+rec_obj <- recipe(Churn ~ ., data = train_tbl) %>%
+  step_discretize(tenure, options = list(cuts = 6)) %>%
+  step_log(TotalCharges) %>%
+  step_dummy(all_nominal(), -all_outcomes()) %>%
+  step_center(all_predictors(), -all_outcomes()) %>%
+  step_scale(all_predictors(), -all_outcomes()) %>%
+  prep(data = train_tbl)
+```
+- Print the recipe object
+```{r}
+rec_obj
+```
+2. BAKING WITH YOUR RECIPE
+We can apply the “recipe” to any data set with the bake() function, and it processes the data following our recipe steps. We’ll apply to our training and testing data to convert from raw data to a machine learning dataset.
+```{r}
+x_train_tbl <- bake(rec_obj, new_data = train_tbl) %>% select(-Churn)
+x_test_tbl  <- bake(rec_obj, new_data = test_tbl) %>% select(-Churn)
+
+glimpse(x_train_tbl)
+```
+3. Response variables for training and testing sets
+```{r}
+y_train_vec <- ifelse(pull(train_tbl, Churn) == "Yes", 1, 0)
+y_test_vec  <- ifelse(pull(test_tbl, Churn) == "Yes", 1, 0)
+```
+
+# Model Customer Churn With Keras (Deep Learning)
+- `keras_model_sequential()` used  to initialize a sequential model. The sequential model is composed of a linear stack of layers.
+-  Hidden Layers: Hidden layers form the neural network nodes that enable non-linear activation using weights. The hidden layers are created using `layer_dense()`. We’ll add two hidden layers. We’ll apply units = 16, which is the number of nodes. We’ll select `kernel_initializer` = "uniform" and `activation` = "relu" for both layers. The first layer needs to have the input_shape = 35, which is the number of columns in the training set. Key Point: While we are arbitrarily selecting the number of hidden layers, units, kernel initializers and activation functions, these parameters can be optimized through a process called hyperparameter tuning that is discussed in Next Steps.
+- Dropout Layers: Dropout layers are used to control overfitting. This eliminates weights below a cutoff threshold to prevent low weights from overfitting the layers. We use the `layer_dropout() `function add two drop out layers with rate = 0.10 to remove weights below 10%.
+- Output Layer: The output layer specifies the shape of the output and the method of assimilating the learned information. The output layer is applied using the `layer_dense()`. For binary values, the shape should be units = 1. For multi-classification, the units should correspond to the number of classes. We set the `kernel_initializer` = "uniform" and the `activation` = "sigmoid" (common for binary classification).
+- Compile the model: The last step is to compile the model with `compile()`. We’ll use optimizer = "adam", which is one of the most popular optimization algorithms. We select loss = "binary_crossentropy" since this is a binary classification problem. We’ll select metrics = c("accuracy") to be evaluated during training and testing.
+```{r}
+# Building our Artificial Neural Network
+model_keras <- keras_model_sequential()
+
+model_keras %>% 
+  
+  # First hidden layer
+  layer_dense(
+    units              = 16, 
+    kernel_initializer = "uniform", 
+    activation         = "relu", 
+    input_shape        = ncol(x_train_tbl)) %>% 
+  
+  # Dropout to prevent overfitting
+  layer_dropout(rate = 0.1) %>%
+  
+  # Second hidden layer
+  layer_dense(
+    units              = 16, 
+    kernel_initializer = "uniform", 
+    activation         = "relu") %>% 
+  
+  # Dropout to prevent overfitting
+  layer_dropout(rate = 0.1) %>%
+  
+  # Output layer
+  layer_dense(
+    units              = 1, 
+    kernel_initializer = "uniform", 
+    activation         = "sigmoid") %>% 
+  
+  # Compile ANN
+  compile(
+    optimizer = 'adam',
+    loss      = 'binary_crossentropy',
+    metrics   = c('accuracy')
+  )
+
+summary(model_keras)
+```
+# Fit the keras model to the training data
+```{r echo=TRUE}
+
+history <- fit(
+  object           = model_keras, 
+  x                = as.matrix(x_train_tbl), 
+  y                = y_train_vec,
+  batch_size       = 50, 
+  epochs           = 35,
+  validation_split = 0.30
+)
+```
+# Making prediction
+- `predict_classes()`: Generates class values as a matrix of ones and zeros. Since we are dealing with binary classification, we’ll convert the output to a vector.
+- `predict_proba()`: Generates the class probabilities as a numeric matrix indicating the probability of being a class. Again, we convert to a numeric vector because there is only one column output.
+```{r}
+# Predicted Class
+yhat_keras_class_vec <- predict_classes(object = model_keras, x = as.matrix(x_test_tbl)) %>% as.vector()
+
+# Predicted Class Probability
+yhat_keras_prob_vec  <- predict_proba(object = model_keras, x = as.matrix(x_test_tbl)) %>%
+    as.vector()
+```
+# Inspect performance with Yardstick
+- Format test data and predictions for yardstick metrics
+```{r}
+
+estimates_keras_tbl <- tibble(
+  truth      = as.factor(y_test_vec) %>% fct_recode(yes = "1", no = "0"),
+  estimate   = as.factor(yhat_keras_class_vec) %>% fct_recode(yes = "1", no = "0"),
+  class_prob = yhat_keras_prob_vec
+)
+
+estimates_keras_tbl
+```
+- CONFUSION TABLE
+```{r}
+options(yardstick.event_first = FALSE)
+estimates_keras_tbl %>% conf_mat(truth, estimate)
+```
+- Accuracy
+```{r}
+estimates_keras_tbl %>% metrics(truth, estimate)
+```
+- AUC
+```{r}
+estimates_keras_tbl %>% roc_auc(truth, class_prob)
+```
+- Precision and Recall
+```{r}
+precision = estimates_keras_tbl %>% precision(truth, estimate)
+recall    = estimates_keras_tbl %>% recall(truth, estimate)
+precision
+recall
+```
+
+- F1 score
+```{r}
+estimates_keras_tbl %>% f_meas(truth, estimate, beta = 1)
+```
+# Explain The Model With LIME
+LIME stands for Local Interpretable Model-agnostic Explanations, and is a method for explaining black-box machine learning model classifiers.
+
+- SETUP
+`model_type`: Used to tell lime what type of model we are dealing with. It could be classification, regression, survival, etc.
+`predict_model`: Used to allow lime to perform predictions that its algorithm can interpret.
+
+The first thing we need to do is identify the class of our model object. We do this with the `class()` function.
+Next we create our `model_type()` function. It’s only input is x the keras model. The function simply returns “classification”, which tells LIME we are classifying.
+Now we can create our `predict_model()` function, which wraps keras::predict_proba(). The trick here is to realize that it’s inputs must be x a model, newdata a dataframe object (this is important), and type which is not used but can be use to switch the output type. The output is also a little tricky because it must be in the format of probabilities by classification (this is important; shown next).
+
+```{r}
+library(lime)
+# Identify the class of our model object. We do this with the class() function.
+class(model_keras)
+
+# Setup lime::model_type() function for keras
+model_type.keras.engine.sequential.Sequential <- function(x, ...) {
+  "classification"
+}
+
+# Setup lime::predict_model() function for keras
+predict_model.keras.engine.sequential.Sequential <- function(x, newdata, type, ...) {
+  pred <- predict_proba(object = x, x = as.matrix(newdata))
+  data.frame(Yes = pred, No = 1 - pred)
+}
+```
+- Test our predict_model() function
+- Create an explainer using the `lime() `function. Just pass the training data set without the “Attribution column”. The form must be a data frame, which is OK since our predict_model function will switch it to an keras object. Set `model = model_keras` our leader model, and bin_continuous = FALSE. We could tell the algorithm to bin continuous variables, but this may not make sense for categorical numeric data that we didn’t change to factors.
+- run the `explain()` function, which returns the explanation. We set n_labels = 1 because we care about explaining a single class. Setting n_features = 4 returns the top four features that are critical to each case. Finally, setting kernel_width = 0.5 allows us to increase the “model_r2” value by shrinking the localized evaluation.
+```{r}
+# Test our predict_model() function
+predict_model(x = model_keras, newdata = x_test_tbl, type = 'raw') %>%
+  tibble::as_tibble()
+
+# Run lime() on training set
+explainer <- lime::lime(
+  x              = x_train_tbl,
+  model          = model_keras,
+  bin_continuous = FALSE
+)
+
+explanation <- lime::explain(
+  x_test_tbl[1:10, ],
+  explainer    = explainer,
+  n_labels     = 1,
+  n_features   = 4,
+  kernel_width = 0.5
+)
+
+```
+- Feature importance visualization
+visualize each of the first ten cases (observations) from the test data. The top four features for each case are shown. Note that they are not the same for each case. The green bars mean that the feature supports the model conclusion, and the red bars contradict. A few important features based on frequency in first ten cases:
+```{r, fig.width = 10, fig.height=10}
+plot_features(explanation) +
+  labs(title = "LIME Feature Importance Visualization",
+       subtitle = "Hold Out (Test) Set, First 10 Cases Shown")
+```
+
+# Check Explanations With Correlation Analysis
+- One thing we need to be careful with the LIME visualization is that we are only doing a sample of the data, in our case the first 10 test observations. Therefore, we are gaining a very localized understanding of how the ANN works. However, we also want to know on from a global perspective what drives feature importance.
+- We can perform a correlation analysis as well on the training set as well to help glean what features correlate globally to “Churn”. We’ll use the corrr package, which performs tidy correlations with the function correlate(). We can get the correlations as follows.
+```{r}
+# Feature correlations to Churn
+corrr_analysis <- x_train_tbl %>%
+  mutate(Churn = y_train_vec) %>%
+  correlate() %>%
+  focus(Churn) %>%
+  rename(feature = rowname) %>%
+  arrange(abs(Churn)) %>%
+  mutate(feature = as_factor(feature)) 
+corrr_analysis
+```
+- The correlation visualization helps in distinguishing which features are relavant to Churn.
+```{r}
+corrr_analysis %>%
+  ggplot(aes(x = Churn, y = fct_reorder(feature, desc(Churn)))) +
+  geom_point() +
+  # Positive Correlations - Contribute to churn
+  geom_segment(aes(xend = 0, yend = feature), 
+               color = palette_light()[[2]], 
+               data = corrr_analysis %>% filter(Churn > 0)) +
+  geom_point(color = palette_light()[[2]], 
+             data = corrr_analysis %>% filter(Churn > 0)) +
+  # Negative Correlations - Prevent churn
+  geom_segment(aes(xend = 0, yend = feature), 
+               color = palette_light()[[1]], 
+               data = corrr_analysis %>% filter(Churn < 0)) +
+  geom_point(color = palette_light()[[1]], 
+             data = corrr_analysis %>% filter(Churn < 0)) +
+  # Vertical lines
+  geom_vline(xintercept = 0, color = palette_light()[[5]], size = 1, linetype = 2) +
+  geom_vline(xintercept = -0.25, color = palette_light()[[5]], size = 1, linetype = 2) +
+  geom_vline(xintercept = 0.25, color = palette_light()[[5]], size = 1, linetype = 2) +
+  # Aesthetics
+  theme_tq() +
+  labs(title = "Churn Correlation Analysis",
+       subtitle = paste("Positive Correlations (contribute to churn),",
+                        "Negative Correlations (prevent churn)"), 
+       y = "Feature Importance")
+
+```
+The correlation analysis helps us quickly disseminate which features that the LIME analysis may be excluding. We can see that the following features are highly correlated (magnitude > 0.25):
+
+Increases Likelihood of Churn (Red): - Tenure = Bin 1 (<12 Months) - Internet Service = “Fiber Optic” - Payment Method = “Electronic Check”
+
+Decreases Likelihood of Churn (Blue): - Contract = “Two Year” - Total Charges (Note that this may be a biproduct of additional services such as Online Security)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
